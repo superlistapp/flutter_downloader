@@ -47,6 +47,42 @@ static NSMutableArray<FlutterEngine *> *engines;
     [super tearDown];
 }
 
+// Spins the main run loop until `condition` holds or `timeout` passes.
+- (BOOL)waitUntil:(BOOL (^)(void))condition timeout:(NSTimeInterval)timeout {
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:timeout];
+    while (!condition() && [deadline timeIntervalSinceNow] > 0) {
+        [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+    }
+    return condition();
+}
+
+- (void)call:(FlutterDownloaderPlugin *)plugin method:(NSString *)method arguments:(id)arguments result:(FlutterResult)result {
+    [plugin handleMethodCall:[FlutterMethodCall methodCallWithMethodName:method arguments:arguments] result:result];
+}
+
+// Waits for the background session through a task method, which runs once it exists.
+- (void)waitForSession:(FlutterDownloaderPlugin *)plugin {
+    __block BOOL answered = NO;
+    [self call:plugin method:@"cancelAll" arguments:nil result:^(id value) { answered = YES; }];
+    XCTAssertTrue([self waitUntil:^BOOL { return answered; } timeout:kSessionCreationDelay * 3]);
+}
+
+- (NSNumber *)storedStatusOf:(NSString *)taskId plugin:(FlutterDownloaderPlugin *)plugin {
+    __block NSNumber *status = nil;
+    [self call:plugin method:@"loadTasks" arguments:nil result:^(NSArray<NSDictionary *> *tasks) {
+        for (NSDictionary *task in tasks) {
+            if ([task[@"task_id"] isEqualToString:taskId]) status = task[@"status"];
+        }
+    }];
+    return status;
+}
+
+- (NSDictionary *)enqueueArguments:(NSString *)fileName {
+    // Not routable: the task stays running until it is canceled.
+    return @{@"url": [@"http://10.255.255.1/" stringByAppendingString:fileName], @"saved_dir": NSTemporaryDirectory(),
+             @"file_name": fileName, @"headers": @"", @"show_notification": @NO, @"open_file_from_notification": @NO};
+}
+
 // Registers the plugin as GeneratedPluginRegistrant does on an engine.
 - (FlutterDownloaderPlugin *)registerOnNewEngine {
     NSString *name = [NSString stringWithFormat:@"test-engine-%lu", (unsigned long)engines.count];
@@ -54,6 +90,59 @@ static NSMutableArray<FlutterEngine *> *engines;
     XCTAssertTrue([engine runWithEntrypoint:@"idleEngineMain"]);
     [engines addObject:engine];
     return [[FlutterDownloaderPlugin alloc] init:[engine registrarForPlugin:@"FlutterDownloaderPlugin"]];
+}
+
+// Runs first (tests run in name order) so that it makes the first registration in
+// the process: the session is still being created when the calls arrive.
+- (void)testCallsDuringSessionCreationWaitInOrderWithoutBlockingTheMainThread {
+    FlutterDownloaderPlugin *plugin = [self registerOnNewEngine];
+    [self registerOnNewEngine];
+
+    NSMutableArray<NSString *> *answers = [NSMutableArray array];
+    NSMutableDictionary<NSString *, id> *values = [NSMutableDictionary dictionary];
+    __block BOOL answeredOffMain = NO;
+    __block NSString *firstTaskId = nil, *secondTaskId = nil;
+    FlutterResult (^record)(NSString *) = ^FlutterResult(NSString *label) {
+        return ^(id value) {
+            answeredOffMain |= !NSThread.isMainThread;
+            [answers addObject:label];
+            if (value != nil) values[label] = value;
+        };
+    };
+
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    [self call:plugin method:@"enqueue" arguments:[self enqueueArguments:@"first.bin"] result:^(id value) {
+        firstTaskId = value;
+        record(@"enqueue first")(value);
+    }];
+    [self call:plugin method:@"cancelAll" arguments:nil result:record(@"cancelAll")];
+    [self call:plugin method:@"enqueue" arguments:[self enqueueArguments:@"second.bin"] result:^(id value) {
+        secondTaskId = value;
+        record(@"enqueue second")(value);
+        // What Dart does once enqueue answers: cancel the new task right away.
+        [self call:plugin method:@"cancel" arguments:@{@"task_id": value} result:record(@"cancel second")];
+    }];
+    [self call:plugin method:@"loadTasks" arguments:nil result:record(@"loadTasks")];
+    NSDictionary *unknown = @{@"task_id": @"unknown", @"should_delete_content": @NO};
+    for (NSString *method in @[@"pause", @"remove", @"retry", @"resume", @"cancel", @"open"]) {
+        [self call:plugin method:method arguments:unknown result:record(method)];
+    }
+    XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - start, 0.2, @"a call waited for the session");
+    XCTAssertEqual(answers.count, 0u, @"answered before the session existed: %@", answers);
+
+    NSArray *expected = @[@"enqueue first", @"cancelAll", @"enqueue second", @"cancel second", @"loadTasks",
+                          @"pause", @"remove", @"retry", @"resume", @"cancel", @"open"];
+    XCTAssertTrue([self waitUntil:^BOOL { return answers.count >= expected.count; } timeout:kSessionCreationDelay * 3]);
+    [self waitUntil:^BOOL { return NO; } timeout:0.5];
+    XCTAssertEqualObjects(answers, expected);
+    XCTAssertFalse(answeredOffMain);
+
+    // cancelAll ran after the first enqueue, and the cancel after the second one.
+    XCTAssertTrue([self waitUntil:^BOOL {
+        return [[self storedStatusOf:firstTaskId plugin:plugin] intValue] == 5 &&
+               [[self storedStatusOf:secondTaskId plugin:plugin] intValue] == 5;
+    } timeout:10], @"first %@, second %@", [self storedStatusOf:firstTaskId plugin:plugin],
+                  [self storedStatusOf:secondTaskId plugin:plugin]);
 }
 
 - (void)testRegisteringDoesNotWaitForTheBackgroundSessionOnTheMainThread {
@@ -69,6 +158,7 @@ static NSMutableArray<FlutterEngine *> *engines;
                           @"registration %d waited for the background session", i);
     }
 
+    [self waitForSession:plugins.lastObject];
     NSURLSession *session = [plugins.lastObject currentSession];
     XCTAssertTrue([session.configuration.identifier hasSuffix:kBackgroundSessionSuffix]);
     XCTAssertFalse(backgroundSessionCreatedOnMainThread);
@@ -77,6 +167,7 @@ static NSMutableArray<FlutterEngine *> *engines;
 - (void)testRegisteringOnMoreEnginesKeepsTheSessionAndItsDelegate {
     FlutterDownloaderPlugin *plugin = [self registerOnNewEngine];
     [self registerOnNewEngine];
+    [self waitForSession:plugin];
     NSURLSession *session = [plugin currentSession];
     XCTAssertNotNil(session);
     id<NSURLSessionDelegate> delegate = session.delegate;

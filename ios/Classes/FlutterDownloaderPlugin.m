@@ -54,6 +54,9 @@ static BOOL initialized = NO;
 static BOOL debug = YES;
 static NSURLSession *_session = nil;
 static dispatch_queue_t _sessionQueue = nil;
+// Main thread only: task method calls received before the session exists, in call order.
+static BOOL _sessionReady = NO;
+static NSMutableArray<dispatch_block_t> *_callsWaitingForSession = nil;
 static FlutterEngine *_headlessRunner = nil;
 static int64_t _callbackHandle = 0;
 static int _step = 10;
@@ -117,16 +120,25 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:identifier];
             sessionConfiguration.HTTPMaximumConnectionsPerHost = [maxConcurrentTasks intValue];
             // Creating a background session waits synchronously for nsurlsessiond, and this runs on the
-            // main thread. currentSession waits for it instead, only if a task is needed earlier.
+            // main thread. Task method calls wait for it in whenSessionReady: instead.
             static dispatch_once_t sessionQueueOnce;
             dispatch_once(&sessionQueueOnce, ^{
                 _sessionQueue = dispatch_queue_create("vn.hunghd.flutter_downloader.session", DISPATCH_QUEUE_SERIAL);
             });
             dispatch_async(_sessionQueue, ^{
-                _session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
-                if (debug) {
-                    NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
-                }
+                NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    _session = session;
+                    if (debug) {
+                        NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
+                    }
+                    _sessionReady = YES;
+                    NSArray<dispatch_block_t> *calls = _callsWaitingForSession;
+                    _callsWaitingForSession = nil;
+                    for (dispatch_block_t call in calls) {
+                        call();
+                    }
+                });
             });
         }
 
@@ -166,10 +178,19 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (NSURLSession*)currentSession {
-    if (_sessionQueue != nil) {
-        dispatch_sync(_sessionQueue, ^{});
-    }
     return _session;
+}
+
+// Runs `call` on the main thread once the background session exists, after the calls queued before it.
+- (void)whenSessionReady:(dispatch_block_t)call {
+    if (_sessionQueue == nil || _sessionReady) {
+        call();
+        return;
+    }
+    if (_callsWaitingForSession == nil) {
+        _callsWaitingForSession = [NSMutableArray array];
+    }
+    [_callsWaitingForSession addObject:call];
 }
 
 - (NSURLSessionDownloadTask*)downloadTaskWithURL: (NSURL*) url fileName: (NSString*) fileName andSavedDir: (NSString*) savedDir andHeaders: (NSString*) headers
@@ -972,7 +993,17 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         [self didInitializeDispatcherMethodCall:call result:result];
     } else if ([@"registerCallback" isEqualToString:call.method]) {
         [self registerCallbackMethodCall:call result:result];
-    } else if ([@"enqueue" isEqualToString:call.method]) {
+    } else {
+        // Task methods use the session, or task state that earlier task methods write.
+        // The queued call keeps self alive so that `result` is always answered.
+        [self whenSessionReady:^{
+            [self handleTaskMethodCall:call result:result];
+        }];
+    }
+}
+
+- (void)handleTaskMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    if ([@"enqueue" isEqualToString:call.method]) {
         [self enqueueMethodCall:call result:result];
     } else if ([@"loadTasks" isEqualToString:call.method]) {
         [self loadTasksMethodCall:call result:result];
@@ -1128,7 +1159,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         NSLog(@"URLSessionDidFinishEventsForBackgroundURLSession:");
     }
     // Check if all download tasks have been finished.
-    [[self currentSession] getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
+    [session getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
         if ([downloadTasks count] == 0) {
             if (debug) {
                 NSLog(@"all download tasks have been finished");
