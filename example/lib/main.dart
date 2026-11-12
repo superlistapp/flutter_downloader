@@ -9,6 +9,10 @@ void main() async {
   runApp(const MyApp());
 }
 
+/// Entry point for engines started by the iOS plugin tests.
+@pragma('vm:entry-point')
+void idleEngineMain() {}
+
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 

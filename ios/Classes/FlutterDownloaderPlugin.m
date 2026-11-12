@@ -53,6 +53,7 @@ static FlutterPluginRegistrantCallback registerPlugins = nil;
 static BOOL initialized = NO;
 static BOOL debug = YES;
 static NSURLSession *_session = nil;
+static dispatch_queue_t _sessionQueue = nil;
 static FlutterEngine *_headlessRunner = nil;
 static int64_t _callbackHandle = 0;
 static int _step = 10;
@@ -115,10 +116,18 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             NSString *identifier = [NSString stringWithFormat:@"%@.download.background.session", NSBundle.mainBundle.bundleIdentifier];
             NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:identifier];
             sessionConfiguration.HTTPMaximumConnectionsPerHost = [maxConcurrentTasks intValue];
-            _session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
-            if (debug) {
-                NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
-            }
+            // Creating a background session waits synchronously for nsurlsessiond, and this runs on the
+            // main thread. currentSession waits for it instead, only if a task is needed earlier.
+            static dispatch_once_t sessionQueueOnce;
+            dispatch_once(&sessionQueueOnce, ^{
+                _sessionQueue = dispatch_queue_create("vn.hunghd.flutter_downloader.session", DISPATCH_QUEUE_SERIAL);
+            });
+            dispatch_async(_sessionQueue, ^{
+                _session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
+                if (debug) {
+                    NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
+                }
+            });
         }
 
         _allFilesDownloadedMsg = [mainBundle objectForInfoDictionaryKey:@"FDAllFilesDownloadedMessage"];
@@ -157,6 +166,9 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (NSURLSession*)currentSession {
+    if (_sessionQueue != nil) {
+        dispatch_sync(_sessionQueue, ^{});
+    }
     return _session;
 }
 
