@@ -29,6 +29,15 @@
 
 #define ERROR_NOT_INITIALIZED [FlutterError errorWithCode:@"not_initialized" message:@"initialize() must called first" details:nil]
 #define ERROR_INVALID_TASK_ID [FlutterError errorWithCode:@"invalid_task_id" message:@"not found task corresponding to given task id" details:nil]
+#define ERROR_SESSION_UNAVAILABLE [FlutterError errorWithCode:@"session_unavailable" message:@"the background download session was not ready in time" details:nil]
+
+@interface FlutterDownloaderWaitingCall : NSObject
+@property(nonatomic, copy) dispatch_block_t run;
+@property(nonatomic, copy) FlutterResult result;
+@end
+
+@implementation FlutterDownloaderWaitingCall
+@end
 
 @interface FlutterDownloaderPlugin()<NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate>
 {
@@ -54,9 +63,10 @@ static BOOL initialized = NO;
 static BOOL debug = YES;
 static NSURLSession *_session = nil;
 static dispatch_queue_t _sessionQueue = nil;
-// Main thread only: task method calls received before the session exists, in call order.
-static BOOL _sessionReady = NO;
-static NSMutableArray<dispatch_block_t> *_callsWaitingForSession = nil;
+// Main thread only: task method calls received while a session is being created, in call order.
+static NSUInteger _pendingSessionCreations = 0;
+static NSMutableArray<FlutterDownloaderWaitingCall *> *_callsWaitingForSession = nil;
+static NSTimeInterval _sessionWaitTimeout = 15;
 static FlutterEngine *_headlessRunner = nil;
 static int64_t _callbackHandle = 0;
 static int _step = 10;
@@ -125,6 +135,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             dispatch_once(&sessionQueueOnce, ^{
                 _sessionQueue = dispatch_queue_create("vn.hunghd.flutter_downloader.session", DISPATCH_QUEUE_SERIAL);
             });
+            _pendingSessionCreations++;
             dispatch_async(_sessionQueue, ^{
                 NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
                 dispatch_async(dispatch_get_main_queue(), ^{
@@ -132,11 +143,13 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
                     if (debug) {
                         NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
                     }
-                    _sessionReady = YES;
-                    NSArray<dispatch_block_t> *calls = _callsWaitingForSession;
+                    if (--_pendingSessionCreations > 0) {
+                        return;
+                    }
+                    NSArray<FlutterDownloaderWaitingCall *> *calls = _callsWaitingForSession;
                     _callsWaitingForSession = nil;
-                    for (dispatch_block_t call in calls) {
-                        call();
+                    for (FlutterDownloaderWaitingCall *call in calls) {
+                        call.run();
                     }
                 });
             });
@@ -181,16 +194,31 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     return _session;
 }
 
-// Runs `call` on the main thread once the background session exists, after the calls queued before it.
-- (void)whenSessionReady:(dispatch_block_t)call {
-    if (_sessionQueue == nil || _sessionReady) {
+// Runs `call` on the main thread once no background session is being created, after the calls queued
+// before it. If that takes longer than _sessionWaitTimeout, `call` never runs and `result` gets an error.
+- (void)whenSessionReady:(dispatch_block_t)call result:(FlutterResult)result {
+    if (_pendingSessionCreations == 0) {
         call();
         return;
     }
     if (_callsWaitingForSession == nil) {
         _callsWaitingForSession = [NSMutableArray array];
     }
-    [_callsWaitingForSession addObject:call];
+    FlutterDownloaderWaitingCall *waiting = [[FlutterDownloaderWaitingCall alloc] init];
+    waiting.run = call;
+    waiting.result = result;
+    [_callsWaitingForSession addObject:waiting];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(_sessionWaitTimeout * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if ([_callsWaitingForSession indexOfObjectIdenticalTo:waiting] == NSNotFound) {
+            return;
+        }
+        [_callsWaitingForSession removeObjectIdenticalTo:waiting];
+        waiting.result(ERROR_SESSION_UNAVAILABLE);
+    });
+}
+
++ (void)setSessionWaitTimeout:(NSTimeInterval)timeout {
+    _sessionWaitTimeout = timeout;
 }
 
 - (NSURLSessionDownloadTask*)downloadTaskWithURL: (NSURL*) url fileName: (NSString*) fileName andSavedDir: (NSString*) savedDir andHeaders: (NSString*) headers
@@ -998,7 +1026,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         // The queued call keeps self alive so that `result` is always answered.
         [self whenSessionReady:^{
             [self handleTaskMethodCall:call result:result];
-        }];
+        } result:result];
     }
 }
 

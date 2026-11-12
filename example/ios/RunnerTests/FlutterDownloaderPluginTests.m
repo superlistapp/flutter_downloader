@@ -6,6 +6,7 @@
 @interface FlutterDownloaderPlugin (Testing)
 - (instancetype)init:(NSObject<FlutterPluginRegistrar> *)registrar;
 - (NSURLSession *)currentSession;
++ (void)setSessionWaitTimeout:(NSTimeInterval)timeout;
 @end
 
 static NSString *const kBackgroundSessionSuffix = @".download.background.session";
@@ -185,6 +186,46 @@ static NSMutableArray<FlutterEngine *> *engines;
     [engines removeAllObjects];
     XCTAssertEqual([plugin currentSession], session);
     XCTAssertEqual(session.delegate, delegate);
+}
+
+- (void)testTaskCallsWaitingTooLongForTheSessionFailAndLaterCallsStillRun {
+    [FlutterDownloaderPlugin setSessionWaitTimeout:0.5];
+    FlutterDownloaderPlugin *plugin = [self registerOnNewEngine];
+    // Registered after the headless runner exists, so this one creates a session.
+    [self registerOnNewEngine];
+
+    NSString *lateFile = [NSUUID.UUID.UUIDString stringByAppendingString:@"-late.bin"];
+    __block int lateAnswers = 0;
+    __block id lateAnswer = nil;
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    [self call:plugin method:@"enqueue" arguments:[self enqueueArguments:lateFile] result:^(id value) {
+        lateAnswers++;
+        lateAnswer = value;
+    }];
+    XCTAssertTrue([self waitUntil:^BOOL { return lateAnswers > 0; } timeout:kSessionCreationDelay]);
+    XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - start, kSessionCreationDelay, @"answered only with the session");
+    XCTAssertTrue([lateAnswer isKindOfClass:FlutterError.class], @"%@", lateAnswer);
+    XCTAssertEqualObjects([(FlutterError *)lateAnswer code], @"session_unavailable");
+
+    [FlutterDownloaderPlugin setSessionWaitTimeout:15];
+    __block id taskId = nil;
+    [self call:plugin method:@"enqueue" arguments:[self enqueueArguments:@"after-timeout.bin"] result:^(id value) {
+        taskId = value;
+    }];
+    XCTAssertTrue([self waitUntil:^BOOL { return taskId != nil; } timeout:kSessionCreationDelay * 5]);
+    XCTAssertTrue([taskId isKindOfClass:NSString.class], @"%@", taskId);
+    [self waitUntil:^BOOL { return NO; } timeout:0.5];
+    XCTAssertEqual(lateAnswers, 1, @"the timed-out call also ran");
+
+    __block NSArray<NSDictionary *> *tasks = nil;
+    [self call:plugin method:@"loadTasks" arguments:nil result:^(NSArray<NSDictionary *> *value) { tasks = value; }];
+    XCTAssertTrue([self waitUntil:^BOOL { return tasks != nil; } timeout:2]);
+    for (NSDictionary *task in tasks) {
+        XCTAssertNotEqualObjects(task[@"file_name"], lateFile);
+    }
+    [self call:plugin method:@"cancel" arguments:@{@"task_id": taskId} result:^(id value) {}];
+    XCTAssertTrue([self waitUntil:^BOOL { return [[self storedStatusOf:taskId plugin:plugin] intValue] == 5; }
+                          timeout:10], @"status %@", [self storedStatusOf:taskId plugin:plugin]);
 }
 
 @end
