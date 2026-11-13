@@ -188,6 +188,32 @@ static NSMutableArray<FlutterEngine *> *engines;
     XCTAssertEqual(session.delegate, delegate);
 }
 
+- (void)testSuccessfulQueuedCallIsNotAnsweredAgainAfterItsDeadline {
+    FlutterDownloaderPlugin *plugin = [self registerOnNewEngine];
+    [self registerOnNewEngine];
+    __block BOOL ready = NO;
+    [self call:plugin method:@"cancelAll" arguments:nil result:^(id value) { ready = YES; }];
+    // Earlier tests may still have registrations on the serial creation queue.
+    XCTAssertTrue([self waitUntil:^BOOL { return ready; } timeout:kSessionCreationDelay * 6]);
+
+    [FlutterDownloaderPlugin setSessionWaitTimeout:3];
+    [self registerOnNewEngine];
+    __block int answers = 0;
+    __block int errors = 0;
+    [self call:plugin method:@"loadTasks" arguments:nil result:^(id value) {
+        answers++;
+        errors += [value isKindOfClass:FlutterError.class] ? 1 : 0;
+    }];
+    XCTAssertEqual(answers, 0);
+    XCTAssertTrue([self waitUntil:^BOOL { return answers > 0; } timeout:6]);
+    XCTAssertEqual(errors, 0);
+    // The timeout must remain harmless after the ready callback clears the queue.
+    [self waitUntil:^BOOL { return NO; } timeout:3.5];
+    XCTAssertEqual(answers, 1);
+    XCTAssertEqual(errors, 0);
+    [FlutterDownloaderPlugin setSessionWaitTimeout:15];
+}
+
 - (void)testTaskCallsWaitingTooLongForTheSessionFailAndLaterCallsStillRun {
     [FlutterDownloaderPlugin setSessionWaitTimeout:0.5];
     FlutterDownloaderPlugin *plugin = [self registerOnNewEngine];

@@ -209,7 +209,8 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     waiting.result = result;
     [_callsWaitingForSession addObject:waiting];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(_sessionWaitTimeout * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if ([_callsWaitingForSession indexOfObjectIdenticalTo:waiting] == NSNotFound) {
+        if (_callsWaitingForSession == nil ||
+            [_callsWaitingForSession indexOfObjectIdenticalTo:waiting] == NSNotFound) {
             return;
         }
         [_callsWaitingForSession removeObjectIdenticalTo:waiting];
