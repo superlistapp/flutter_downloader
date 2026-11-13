@@ -84,12 +84,17 @@ static NSMutableArray<FlutterEngine *> *engines;
              @"file_name": fileName, @"headers": @"", @"show_notification": @NO, @"open_file_from_notification": @NO};
 }
 
-// Registers the plugin as GeneratedPluginRegistrant does on an engine.
-- (FlutterDownloaderPlugin *)registerOnNewEngine {
+- (FlutterEngine *)newEngine {
     NSString *name = [NSString stringWithFormat:@"test-engine-%lu", (unsigned long)engines.count];
     FlutterEngine *engine = [[FlutterEngine alloc] initWithName:name project:nil allowHeadlessExecution:YES];
     XCTAssertTrue([engine runWithEntrypoint:@"idleEngineMain"]);
     [engines addObject:engine];
+    return engine;
+}
+
+// Registers the plugin as GeneratedPluginRegistrant does on an engine.
+- (FlutterDownloaderPlugin *)registerOnNewEngine {
+    FlutterEngine *engine = [self newEngine];
     return [[FlutterDownloaderPlugin alloc] init:[engine registrarForPlugin:@"FlutterDownloaderPlugin"]];
 }
 
@@ -153,8 +158,10 @@ static NSMutableArray<FlutterEngine *> *engines;
     // startBackgroundIsolate registers on it, which owns the background session.
     NSMutableArray<FlutterDownloaderPlugin *> *plugins = [NSMutableArray array];
     for (int i = 0; i < 2; i++) {
+        // Engine startup is unrelated to the plugin's synchronous session work.
+        FlutterEngine *engine = [self newEngine];
         CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
-        [plugins addObject:[self registerOnNewEngine]];
+        [plugins addObject:[[FlutterDownloaderPlugin alloc] init:[engine registrarForPlugin:@"FlutterDownloaderPlugin"]]];
         XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - start, kSessionCreationDelay / 4,
                           @"registration %d waited for the background session", i);
     }
