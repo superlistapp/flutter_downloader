@@ -29,6 +29,15 @@
 
 #define ERROR_NOT_INITIALIZED [FlutterError errorWithCode:@"not_initialized" message:@"initialize() must called first" details:nil]
 #define ERROR_INVALID_TASK_ID [FlutterError errorWithCode:@"invalid_task_id" message:@"not found task corresponding to given task id" details:nil]
+#define ERROR_SESSION_UNAVAILABLE [FlutterError errorWithCode:@"session_unavailable" message:@"the background download session was not ready in time" details:nil]
+
+@interface FlutterDownloaderWaitingCall : NSObject
+@property(nonatomic, copy) dispatch_block_t run;
+@property(nonatomic, copy) FlutterResult result;
+@end
+
+@implementation FlutterDownloaderWaitingCall
+@end
 
 @interface FlutterDownloaderPlugin()<NSURLSessionTaskDelegate, NSURLSessionDownloadDelegate, UIDocumentInteractionControllerDelegate>
 {
@@ -53,6 +62,13 @@ static FlutterPluginRegistrantCallback registerPlugins = nil;
 static BOOL initialized = NO;
 static BOOL debug = YES;
 static NSURLSession *_session = nil;
+static dispatch_queue_t _databaseQueue;
+static char databaseQueueKey;
+static dispatch_queue_t _sessionQueue = nil;
+// Main thread only: task method calls received while a session is being created, in call order.
+static NSUInteger _pendingSessionCreations = 0;
+static NSMutableArray<FlutterDownloaderWaitingCall *> *_callsWaitingForSession = nil;
+static NSTimeInterval _sessionWaitTimeout = 15;
 static FlutterEngine *_headlessRunner = nil;
 static int64_t _callbackHandle = 0;
 static int _step = 10;
@@ -92,9 +108,16 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         if (debug) {
             NSLog(@"database path: %@", dbPath);
         }
-        databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", 0);
-        
-        _dbManager = [[FlutterDownloaderDBManager alloc] initWithDatabaseFilePath:dbPath];
+        // Every engine and session delegate accesses the same SQLite file.
+        static dispatch_once_t databaseQueueOnce;
+        dispatch_once(&databaseQueueOnce, ^{
+            _databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", DISPATCH_QUEUE_SERIAL);
+            dispatch_queue_set_specific(_databaseQueue, &databaseQueueKey, &databaseQueueKey, NULL);
+        });
+        databaseQueue = _databaseQueue;
+        [self executeInDatabaseQueueForTask:^{
+            self->_dbManager = [[FlutterDownloaderDBManager alloc] initWithDatabaseFilePath:dbPath];
+        }];
         
         if (_runningTaskById == nil) {
             _runningTaskById = [[NSMutableDictionary alloc] init];
@@ -115,10 +138,30 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             NSString *identifier = [NSString stringWithFormat:@"%@.download.background.session", NSBundle.mainBundle.bundleIdentifier];
             NSURLSessionConfiguration *sessionConfiguration = [NSURLSessionConfiguration backgroundSessionConfigurationWithIdentifier:identifier];
             sessionConfiguration.HTTPMaximumConnectionsPerHost = [maxConcurrentTasks intValue];
-            _session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
-            if (debug) {
-                NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
-            }
+            // Creating a background session waits synchronously for nsurlsessiond, and this runs on the
+            // main thread. Task method calls wait for it in whenSessionReady: instead.
+            static dispatch_once_t sessionQueueOnce;
+            dispatch_once(&sessionQueueOnce, ^{
+                _sessionQueue = dispatch_queue_create("vn.hunghd.flutter_downloader.session", DISPATCH_QUEUE_SERIAL);
+            });
+            _pendingSessionCreations++;
+            dispatch_async(_sessionQueue, ^{
+                NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfiguration delegate:self delegateQueue:nil];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    _session = session;
+                    if (debug) {
+                        NSLog(@"init NSURLSession with id: %@", [[_session configuration] identifier]);
+                    }
+                    if (--_pendingSessionCreations > 0) {
+                        return;
+                    }
+                    NSArray<FlutterDownloaderWaitingCall *> *calls = _callsWaitingForSession;
+                    _callsWaitingForSession = nil;
+                    for (FlutterDownloaderWaitingCall *call in calls) {
+                        call.run();
+                    }
+                });
+            });
         }
 
         _allFilesDownloadedMsg = [mainBundle objectForInfoDictionaryKey:@"FDAllFilesDownloadedMessage"];
@@ -160,6 +203,34 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     return _session;
 }
 
+// Runs `call` on the main thread once no background session is being created, after the calls queued
+// before it. If that takes longer than _sessionWaitTimeout, `call` never runs and `result` gets an error.
+- (void)whenSessionReady:(dispatch_block_t)call result:(FlutterResult)result {
+    if (_pendingSessionCreations == 0) {
+        call();
+        return;
+    }
+    if (_callsWaitingForSession == nil) {
+        _callsWaitingForSession = [NSMutableArray array];
+    }
+    FlutterDownloaderWaitingCall *waiting = [[FlutterDownloaderWaitingCall alloc] init];
+    waiting.run = call;
+    waiting.result = result;
+    [_callsWaitingForSession addObject:waiting];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(_sessionWaitTimeout * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (_callsWaitingForSession == nil ||
+            [_callsWaitingForSession indexOfObjectIdenticalTo:waiting] == NSNotFound) {
+            return;
+        }
+        [_callsWaitingForSession removeObjectIdenticalTo:waiting];
+        waiting.result(ERROR_SESSION_UNAVAILABLE);
+    });
+}
+
++ (void)setSessionWaitTimeout:(NSTimeInterval)timeout {
+    _sessionWaitTimeout = timeout;
+}
+
 - (NSURLSessionDownloadTask*)downloadTaskWithURL: (NSURL*) url fileName: (NSString*) fileName andSavedDir: (NSString*) savedDir andHeaders: (NSString*) headers
 {
     NSMutableURLRequest *request = [[NSMutableURLRequest alloc] initWithURL:url];
@@ -179,8 +250,6 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     NSURLSessionDownloadTask *task = [[self currentSession] downloadTaskWithRequest:request];
     // store task id in taskDescription
     task.taskDescription = [self createTaskId];
-    [task resume];
-
     return task;
 }
 
@@ -301,6 +370,10 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (void)executeInDatabaseQueueForTask:(void (^)(void))task {
+    if (dispatch_get_specific(&databaseQueueKey)) {
+        if (!self.isDatabaseQueueTerminated && task) task();
+        return;
+    }
     __typeof__(self) __weak weakSelf = self;
     dispatch_sync(databaseQueue, ^{
         if (weakSelf.isDatabaseQueueTerminated) return;
@@ -449,7 +522,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 
-- (void)addNewTask:(NSString *)taskId
+- (BOOL)addNewTask:(NSString *)taskId
                url:(NSString *)url
             status:(int)status
            progress:(int)progress
@@ -466,7 +539,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     NSString *sanitizedFileName = [self sanitizeFilename:filename];
     NSArray *values = @[taskId, url, @(status), @(progress), sanitizedFileName, savedDir, headers, @(resumable ? 1:0), @(showNotification ? 1 : 0), @(openFileFromNotification ? 1: 0), @([self currentTimeInMilliseconds])];
     
-    [_dbManager executeQuery:query withParameters:values];
+    BOOL saved = [_dbManager executeQuery:query withParameters:values];
     
     if (debug) {
         if (_dbManager.affectedRows != 0) {
@@ -475,6 +548,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             NSLog(@"Could not execute the query.");
         }
     }
+    return saved;
 }
 
 - (void) updateTask: (NSString*) taskId status: (int) status progress: (int) progress
@@ -622,6 +696,14 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (NSDictionary *)loadTaskWithId:(NSString *)taskId {
+    __block NSDictionary *task;
+    [self executeInDatabaseQueueForTask:^{
+        task = [self loadTaskInDatabaseQueueWithId:taskId];
+    }];
+    return task;
+}
+
+- (NSDictionary *)loadTaskInDatabaseQueueWithId:(NSString *)taskId {
     // Check the task in memory-cache first
     if ([_runningTaskById objectForKey:taskId]) {
         return [_runningTaskById objectForKey:taskId];
@@ -741,9 +823,17 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     
     __typeof__(self) __weak weakSelf = self;
     
+    __block BOOL saved = NO;
     [self executeInDatabaseQueueForTask:^{
-        [weakSelf addNewTask:taskId url:urlString status:STATUS_ENQUEUED progress:0 filename:fileName savedDir:shortSavedDir headers:headers resumable:NO showNotification: [showNotification boolValue] openFileFromNotification: [openFileFromNotification boolValue]];
+        saved = [weakSelf addNewTask:taskId url:urlString status:STATUS_ENQUEUED progress:0 filename:fileName savedDir:shortSavedDir headers:headers resumable:NO showNotification: [showNotification boolValue] openFileFromNotification: [openFileFromNotification boolValue]];
     }];
+    if (!saved) {
+        [_runningTaskById removeObjectForKey:taskId];
+        [task cancel];
+        result([FlutterError errorWithCode:@"database_error" message:@"could not save download task" details:nil]);
+        return;
+    }
+    [task resume];
     result(taskId);
     [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_ENQUEUED) andProgress:@0];
 }
@@ -859,6 +949,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             [self executeInDatabaseQueueForTask:^{
                 [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_ENQUEUED resumable:NO];
             }];
+            [newTask resume];
             result(newTaskId);
             [self sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_ENQUEUED) andProgress:@(0)];
         } else {
@@ -960,7 +1051,17 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         [self didInitializeDispatcherMethodCall:call result:result];
     } else if ([@"registerCallback" isEqualToString:call.method]) {
         [self registerCallbackMethodCall:call result:result];
-    } else if ([@"enqueue" isEqualToString:call.method]) {
+    } else {
+        // Task methods use the session, or task state that earlier task methods write.
+        // The queued call keeps self alive so that `result` is always answered.
+        [self whenSessionReady:^{
+            [self handleTaskMethodCall:call result:result];
+        } result:result];
+    }
+}
+
+- (void)handleTaskMethodCall:(FlutterMethodCall*)call result:(FlutterResult)result {
+    if ([@"enqueue" isEqualToString:call.method]) {
         [self enqueueMethodCall:call result:result];
     } else if ([@"loadTasks" isEqualToString:call.method]) {
         [self loadTasksMethodCall:call result:result];
@@ -1116,7 +1217,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         NSLog(@"URLSessionDidFinishEventsForBackgroundURLSession:");
     }
     // Check if all download tasks have been finished.
-    [[self currentSession] getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
+    [session getTasksWithCompletionHandler:^(NSArray *dataTasks, NSArray *uploadTasks, NSArray *downloadTasks) {
         if ([downloadTasks count] == 0) {
             if (debug) {
                 NSLog(@"all download tasks have been finished");
