@@ -62,6 +62,8 @@ static FlutterPluginRegistrantCallback registerPlugins = nil;
 static BOOL initialized = NO;
 static BOOL debug = YES;
 static NSURLSession *_session = nil;
+static dispatch_queue_t _databaseQueue;
+static char databaseQueueKey;
 static dispatch_queue_t _sessionQueue = nil;
 // Main thread only: task method calls received while a session is being created, in call order.
 static NSUInteger _pendingSessionCreations = 0;
@@ -106,9 +108,16 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
         if (debug) {
             NSLog(@"database path: %@", dbPath);
         }
-        databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", 0);
-        
-        _dbManager = [[FlutterDownloaderDBManager alloc] initWithDatabaseFilePath:dbPath];
+        // Every engine and session delegate accesses the same SQLite file.
+        static dispatch_once_t databaseQueueOnce;
+        dispatch_once(&databaseQueueOnce, ^{
+            _databaseQueue = dispatch_queue_create("vn.hunghd.flutter_downloader", DISPATCH_QUEUE_SERIAL);
+            dispatch_queue_set_specific(_databaseQueue, &databaseQueueKey, &databaseQueueKey, NULL);
+        });
+        databaseQueue = _databaseQueue;
+        [self executeInDatabaseQueueForTask:^{
+            self->_dbManager = [[FlutterDownloaderDBManager alloc] initWithDatabaseFilePath:dbPath];
+        }];
         
         if (_runningTaskById == nil) {
             _runningTaskById = [[NSMutableDictionary alloc] init];
@@ -241,8 +250,6 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     NSURLSessionDownloadTask *task = [[self currentSession] downloadTaskWithRequest:request];
     // store task id in taskDescription
     task.taskDescription = [self createTaskId];
-    [task resume];
-
     return task;
 }
 
@@ -363,6 +370,10 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (void)executeInDatabaseQueueForTask:(void (^)(void))task {
+    if (dispatch_get_specific(&databaseQueueKey)) {
+        if (!self.isDatabaseQueueTerminated && task) task();
+        return;
+    }
     __typeof__(self) __weak weakSelf = self;
     dispatch_sync(databaseQueue, ^{
         if (weakSelf.isDatabaseQueueTerminated) return;
@@ -511,7 +522,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 
-- (void)addNewTask:(NSString *)taskId
+- (BOOL)addNewTask:(NSString *)taskId
                url:(NSString *)url
             status:(int)status
            progress:(int)progress
@@ -528,7 +539,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     NSString *sanitizedFileName = [self sanitizeFilename:filename];
     NSArray *values = @[taskId, url, @(status), @(progress), sanitizedFileName, savedDir, headers, @(resumable ? 1:0), @(showNotification ? 1 : 0), @(openFileFromNotification ? 1: 0), @([self currentTimeInMilliseconds])];
     
-    [_dbManager executeQuery:query withParameters:values];
+    BOOL saved = [_dbManager executeQuery:query withParameters:values];
     
     if (debug) {
         if (_dbManager.affectedRows != 0) {
@@ -537,6 +548,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             NSLog(@"Could not execute the query.");
         }
     }
+    return saved;
 }
 
 - (void) updateTask: (NSString*) taskId status: (int) status progress: (int) progress
@@ -684,6 +696,14 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
 }
 
 - (NSDictionary *)loadTaskWithId:(NSString *)taskId {
+    __block NSDictionary *task;
+    [self executeInDatabaseQueueForTask:^{
+        task = [self loadTaskInDatabaseQueueWithId:taskId];
+    }];
+    return task;
+}
+
+- (NSDictionary *)loadTaskInDatabaseQueueWithId:(NSString *)taskId {
     // Check the task in memory-cache first
     if ([_runningTaskById objectForKey:taskId]) {
         return [_runningTaskById objectForKey:taskId];
@@ -803,9 +823,17 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
     
     __typeof__(self) __weak weakSelf = self;
     
+    __block BOOL saved = NO;
     [self executeInDatabaseQueueForTask:^{
-        [weakSelf addNewTask:taskId url:urlString status:STATUS_ENQUEUED progress:0 filename:fileName savedDir:shortSavedDir headers:headers resumable:NO showNotification: [showNotification boolValue] openFileFromNotification: [openFileFromNotification boolValue]];
+        saved = [weakSelf addNewTask:taskId url:urlString status:STATUS_ENQUEUED progress:0 filename:fileName savedDir:shortSavedDir headers:headers resumable:NO showNotification: [showNotification boolValue] openFileFromNotification: [openFileFromNotification boolValue]];
     }];
+    if (!saved) {
+        [_runningTaskById removeObjectForKey:taskId];
+        [task cancel];
+        result([FlutterError errorWithCode:@"database_error" message:@"could not save download task" details:nil]);
+        return;
+    }
+    [task resume];
     result(taskId);
     [self sendUpdateProgressForTaskId:taskId inStatus:@(STATUS_ENQUEUED) andProgress:@0];
 }
@@ -921,6 +949,7 @@ static NSMutableDictionary<NSString*, NSMutableDictionary*> *_runningTaskById = 
             [self executeInDatabaseQueueForTask:^{
                 [weakSelf updateTask:taskId newTaskId:newTaskId status:STATUS_ENQUEUED resumable:NO];
             }];
+            [newTask resume];
             result(newTaskId);
             [self sendUpdateProgressForTaskId:newTaskId inStatus:@(STATUS_ENQUEUED) andProgress:@(0)];
         } else {

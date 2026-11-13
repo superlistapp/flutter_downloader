@@ -2,10 +2,12 @@
 #import <XCTest/XCTest.h>
 #import <flutter_downloader/FlutterDownloaderPlugin.h>
 #import <objc/runtime.h>
+#import <sqlite3.h>
 
 @interface FlutterDownloaderPlugin (Testing)
 - (instancetype)init:(NSObject<FlutterPluginRegistrar> *)registrar;
 - (NSURLSession *)currentSession;
+- (NSDictionary *)loadTaskWithId:(NSString *)taskId;
 + (void)setSessionWaitTimeout:(NSTimeInterval)timeout;
 @end
 
@@ -151,6 +153,73 @@ static NSMutableArray<FlutterEngine *> *engines;
                   [self storedStatusOf:secondTaskId plugin:plugin]);
 }
 
+- (void)testDatabaseReadsFromAnotherEngineWaitForTheSharedQueue {
+    FlutterDownloaderPlugin *first = [self registerOnNewEngine];
+    FlutterDownloaderPlugin *second = [self registerOnNewEngine];
+    [self waitForSession:first];
+    dispatch_queue_t queue = [first valueForKey:@"databaseQueue"];
+    XCTAssertEqual(queue, [second valueForKey:@"databaseQueue"]);
+    dispatch_semaphore_t entered = dispatch_semaphore_create(0);
+    dispatch_semaphore_t release = dispatch_semaphore_create(0);
+    dispatch_semaphore_t reading = dispatch_semaphore_create(0);
+    dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+    dispatch_async(queue, ^{
+        dispatch_semaphore_signal(entered);
+        dispatch_semaphore_wait(release, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+    });
+    XCTAssertEqual(dispatch_semaphore_wait(entered, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)), 0);
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        dispatch_semaphore_signal(reading);
+        [second loadTaskWithId:NSUUID.UUID.UUIDString];
+        dispatch_semaphore_signal(finished);
+    });
+    XCTAssertEqual(dispatch_semaphore_wait(reading, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)), 0);
+    long early = dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC / 10));
+    dispatch_semaphore_signal(release);
+    XCTAssertNotEqual(early, 0, @"a callback read bypassed the shared database queue");
+    if (early != 0) {
+        XCTAssertEqual(dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)), 0);
+    }
+}
+
+- (void)testEnqueueReportsDatabaseFailureAndRecoversAfterUnlock {
+    FlutterDownloaderPlugin *plugin = [self registerOnNewEngine];
+    [self registerOnNewEngine];
+    [self waitForSession:plugin];
+    NSString *directory = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+    sqlite3 *database = NULL;
+    XCTAssertEqual(sqlite3_open([[directory stringByAppendingPathComponent:@"download_tasks.sql"] UTF8String], &database), SQLITE_OK);
+    NSString *fileName = [NSUUID.UUID.UUIDString stringByAppendingString:@"-locked.bin"];
+    __block id answer = nil;
+    __block int answers = 0;
+    XCTAssertEqual(sqlite3_exec(database, "BEGIN EXCLUSIVE", NULL, NULL, NULL), SQLITE_OK);
+    CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
+    @try {
+        [self call:plugin method:@"enqueue" arguments:[self enqueueArguments:fileName] result:^(id value) {
+            answer = value;
+            answers++;
+        }];
+    } @finally {
+        sqlite3_exec(database, "ROLLBACK", NULL, NULL, NULL);
+        sqlite3_close(database);
+    }
+    XCTAssertLessThan(CFAbsoluteTimeGetCurrent() - start, 0.5);
+    XCTAssertTrue([answer isKindOfClass:FlutterError.class], @"%@", answer);
+    if ([answer isKindOfClass:FlutterError.class]) XCTAssertEqualObjects([(FlutterError *)answer code], @"database_error");
+    [self call:plugin method:@"loadTasks" arguments:nil result:^(NSArray<NSDictionary *> *tasks) {
+        for (NSDictionary *task in tasks) XCTAssertNotEqualObjects(task[@"file_name"], fileName);
+    }];
+    __block id recovered = nil;
+    [self call:plugin method:@"enqueue" arguments:[self enqueueArguments:fileName] result:^(id value) { recovered = value; }];
+    XCTAssertTrue([recovered isKindOfClass:NSString.class], @"%@", recovered);
+    if ([recovered isKindOfClass:NSString.class]) {
+        XCTAssertNotNil([self storedStatusOf:recovered plugin:plugin]);
+        [self call:plugin method:@"cancel" arguments:@{@"task_id": recovered} result:^(id value) {}];
+        XCTAssertTrue([self waitUntil:^BOOL { return [[self storedStatusOf:recovered plugin:plugin] intValue] == 5; } timeout:10]);
+    }
+    XCTAssertEqual(answers, 1);
+}
+
 - (void)testRegisteringDoesNotWaitForTheBackgroundSessionOnTheMainThread {
     XCTAssertTrue(NSThread.isMainThread);
 
@@ -184,6 +253,7 @@ static NSMutableArray<FlutterEngine *> *engines;
     // GeneratedPluginRegistrant, which registers this plugin again.
     [self registerOnNewEngine];
     [self registerOnNewEngine];
+    [self waitForSession:plugin];
     XCTAssertEqual([plugin currentSession], session);
     XCTAssertEqual(session.delegate, delegate);
 
@@ -219,6 +289,33 @@ static NSMutableArray<FlutterEngine *> *engines;
     XCTAssertEqual(answers, 1);
     XCTAssertEqual(errors, 0);
     [FlutterDownloaderPlugin setSessionWaitTimeout:15];
+}
+
+- (void)testRetryStartsTheDownloadAfterUpdatingItsPersistedId {
+    FlutterDownloaderPlugin *plugin = [self registerOnNewEngine];
+    [self registerOnNewEngine];
+    __block BOOL ready = NO;
+    [self call:plugin method:@"cancelAll" arguments:nil result:^(id value) { ready = YES; }];
+    // The preceding engine-lifecycle test can leave registrations queued.
+    XCTAssertTrue([self waitUntil:^BOOL { return ready; } timeout:kSessionCreationDelay * 6]);
+    __block id original = nil;
+    [self call:plugin method:@"enqueue" arguments:[self enqueueArguments:@"retry.bin"] result:^(id value) { original = value; }];
+    XCTAssertTrue([original isKindOfClass:NSString.class]);
+    if (![original isKindOfClass:NSString.class]) return;
+    [self call:plugin method:@"cancel" arguments:@{@"task_id": original} result:^(id value) {}];
+    XCTAssertTrue([self waitUntil:^BOOL {
+        return [[self storedStatusOf:original plugin:plugin] intValue] == 5 &&
+               [[[plugin loadTaskWithId:original] objectForKey:@"status"] intValue] == 5;
+    } timeout:10]);
+    __block id retried = nil;
+    [self call:plugin method:@"retry" arguments:@{@"task_id": original} result:^(id value) { retried = value; }];
+    XCTAssertTrue([retried isKindOfClass:NSString.class], @"%@", retried);
+    if (![retried isKindOfClass:NSString.class]) return;
+    XCTAssertNotEqualObjects(retried, original);
+    XCTAssertNotNil([self storedStatusOf:retried plugin:plugin]);
+    XCTAssertNil([self storedStatusOf:original plugin:plugin]);
+    [self call:plugin method:@"cancel" arguments:@{@"task_id": retried} result:^(id value) {}];
+    XCTAssertTrue([self waitUntil:^BOOL { return [[self storedStatusOf:retried plugin:plugin] intValue] == 5; } timeout:10]);
 }
 
 - (void)testTaskCallsWaitingTooLongForTheSessionFailAndLaterCallsStillRun {
