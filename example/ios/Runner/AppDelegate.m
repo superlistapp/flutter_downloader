@@ -12,7 +12,10 @@ void registerPlugins(NSObject<FlutterPluginRegistry>* registry) {
 
 - (BOOL)application:(UIApplication *)application
     didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-  [GeneratedPluginRegistrant registerWithRegistry:self];
+  // The plugin tests register the plugin themselves, so they control its first registration.
+  if (NSProcessInfo.processInfo.environment[@"XCTestConfigurationFilePath"] == nil) {
+    [GeneratedPluginRegistrant registerWithRegistry:self];
+  }
   [FlutterDownloaderPlugin setPluginRegistrantCallback:registerPlugins];
   // Override point for customization after application launch.
   return [super application:application didFinishLaunchingWithOptions:launchOptions];

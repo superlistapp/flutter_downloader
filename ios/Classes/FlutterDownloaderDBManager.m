@@ -16,7 +16,7 @@
 @property (nonatomic, strong) NSMutableArray *arrResults;
 
 -(void)copyDatabaseIntoAppDirectory;
--(void)runQuery:(const char *)query withParameters:(NSArray *)parameters isQueryExecutable:(BOOL)queryExecutable;
+-(BOOL)runQuery:(const char *)query withParameters:(NSArray *)parameters isQueryExecutable:(BOOL)queryExecutable;
 
 @end
 
@@ -84,7 +84,10 @@
 }
 
 
-- (void)runQuery:(const char *)query withParameters:(NSArray *)parameters isQueryExecutable:(BOOL)queryExecutable {
+- (BOOL)runQuery:(const char *)query withParameters:(NSArray *)parameters isQueryExecutable:(BOOL)queryExecutable {
+    BOOL succeeded = NO;
+    self.affectedRows = 0;
+    self.lastInsertedRowID = 0;
 
     if (debug) {
         NSLog(@"execute query: %s", query);
@@ -116,7 +119,8 @@
         if (debug) {
             NSLog(@"error opening the database with error no.: %d", openDatabaseResult);
         }
-        return;
+        sqlite3_close(sqlite3Database);
+        return NO;
     }
     
     if (openDatabaseResult == SQLITE_OK) {
@@ -150,6 +154,9 @@
                     }
                     if (bindResult != SQLITE_OK) {
                         NSLog(@"Error binding parameter at index %d: %s", i, sqlite3_errmsg(sqlite3Database));
+                        sqlite3_finalize(compiledStatement);
+                        sqlite3_close(sqlite3Database);
+                        return NO;
                     }
                 }
             }
@@ -158,6 +165,7 @@
             if (queryExecutable) {
                 int executeQueryResults = sqlite3_step(compiledStatement);
                 if (executeQueryResults == SQLITE_DONE) {
+                    succeeded = YES;
                     // Keep the affected rows.
                     self.affectedRows = sqlite3_changes(sqlite3Database);
                     
@@ -220,6 +228,7 @@
         // Close the database.
         sqlite3_close(sqlite3Database);
     }
+    return succeeded;
 }
 
 -(NSArray *)loadDataFromDB:(NSString *)query withParameters:(NSArray *)parameters{
@@ -232,9 +241,9 @@
 
 
 
-- (void)executeQuery:(NSString *)query withParameters:(NSArray *)parameters {
+- (BOOL)executeQuery:(NSString *)query withParameters:(NSArray *)parameters {
     // Run the query with parameters.
-    [self runQuery:[query UTF8String] withParameters:parameters isQueryExecutable:YES];
+    return [self runQuery:[query UTF8String] withParameters:parameters isQueryExecutable:YES];
 }
 
 @end
